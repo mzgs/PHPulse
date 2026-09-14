@@ -1,0 +1,6 @@
+{
+  "Blade section": { "prefix": "section", "body": ["@section('${1:name}')", "    $0", "@endsection"] },
+  "Blade foreach": { "prefix": "foreach", "body": ["@foreach (${1:\\$items} as ${2:\\$item})", "    $0", "@endforeach"] },
+  "Blade component": { "prefix": "component", "body": ["<x-${1:component}>", "    $0", "</x-${1:component}>"] },
+  "Blade if": { "prefix": "bif", "body": ["@if (${1:condition})", "    $0", "@endif"] }
+}

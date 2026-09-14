@@ -1,0 +1,35 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "PHP",
+  "scopeName": "source.php",
+  "patterns": [
+    { "include": "#php" },
+    { "include": "text.html.basic" }
+  ],
+  "repository": {
+    "php": {
+      "begin": "<\\?(?:php|=)?",
+      "beginCaptures": { "0": { "name": "punctuation.section.embedded.begin.php" } },
+      "end": "\\?>",
+      "endCaptures": { "0": { "name": "punctuation.section.embedded.end.php" } },
+      "patterns": [
+        { "include": "#comments" }, { "include": "#strings" },
+        { "match": "\\b(class|interface|trait|enum|function|fn|namespace|use|extends|implements|new|clone|public|protected|private|static|abstract|final|readonly|const|var|return|yield|throw|try|catch|finally|if|elseif|else|switch|case|default|match|while|do|for|foreach|break|continue|declare|include|include_once|require|require_once|instanceof|insteadof|as|echo|print|global|unset|isset|empty|list|array|callable|iterable|void|never|mixed|object|string|int|float|bool|null|true|false|self|parent)\\b", "name": "keyword.control.php" },
+        { "match": "\\$[A-Za-z_][A-Za-z0-9_]*", "name": "variable.other.php" },
+        { "match": "\\b[0-9]+(?:\\.[0-9]+)?\\b", "name": "constant.numeric.php" },
+        { "match": "\\b[A-Z_][A-Z0-9_]*\\b", "name": "constant.other.php" },
+        { "match": "(?<=function\\s)[A-Za-z_][A-Za-z0-9_]*", "name": "entity.name.function.php" },
+        { "match": "(?<=(?:class|interface|trait|enum)\\s)[A-Za-z_][A-Za-z0-9_]*", "name": "entity.name.type.php" }
+      ]
+    },
+    "comments": { "patterns": [
+      { "begin": "/\\*\\*", "end": "\\*/", "name": "comment.block.documentation.php", "patterns": [{ "match": "@[A-Za-z_-]+", "name": "storage.type.class.phpdoc" }] },
+      { "begin": "/\\*", "end": "\\*/", "name": "comment.block.php" },
+      { "begin": "//|#", "end": "$", "name": "comment.line.php" }
+    ] },
+    "strings": { "patterns": [
+      { "begin": "\"", "end": "\"", "name": "string.quoted.double.php", "patterns": [{ "match": "\\$[A-Za-z_][A-Za-z0-9_]*", "name": "variable.other.php" }, { "match": "\\\\.", "name": "constant.character.escape.php" }] },
+      { "begin": "'", "end": "'", "name": "string.quoted.single.php", "patterns": [{ "match": "\\\\.", "name": "constant.character.escape.php" }] }
+    ] }
+  }
+}

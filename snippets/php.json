@@ -1,0 +1,9 @@
+{
+  "PHP open tag": { "prefix": "php", "body": ["<?php", "", "$0"] },
+  "Class": { "prefix": "class", "body": ["class ${1:Name}", "{", "    $0", "}"] },
+  "Constructor": { "prefix": "ctor", "body": ["public function __construct(${1})", "{", "    $0", "}"] },
+  "Function": { "prefix": "fun", "body": ["${1:public} function ${2:name}(${3}): ${4:void}", "{", "    $0", "}"] },
+  "PHPDoc": { "prefix": "doc", "body": ["/**", " * ${1:Description}", " *", " * @return ${2:void}", " */"] },
+  "Try catch": { "prefix": "try", "body": ["try {", "    $1", "} catch (\\Throwable $e) {", "    $0", "}"] },
+  "Match": { "prefix": "match", "body": ["match (${1:value}) {", "    ${2:key} => ${3:value},", "    default => ${4:null},", "};"] }
+}

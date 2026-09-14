@@ -1,0 +1,90 @@
+{
+  "name": "phpulse-vscode",
+  "displayName": "PHPulse — PHP Tools",
+  "description": "Advanced PHP and Laravel development tools for Visual Studio Code.",
+  "version": "0.1.0",
+  "publisher": "local",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/mzgs/PHPulse.git"
+  },
+  "homepage": "https://github.com/mzgs/PHPulse#readme",
+  "bugs": {
+    "url": "https://github.com/mzgs/PHPulse/issues"
+  },
+  "engines": { "vscode": "^1.96.0" },
+  "categories": ["Programming Languages", "Debuggers", "Formatters", "Linters", "Testing"],
+  "keywords": ["php", "laravel", "blade", "phpunit", "pest", "xdebug", "composer"],
+  "activationEvents": ["onLanguage:php", "onLanguage:blade", "workspaceContains:**/composer.json", "onDebug:php"],
+  "main": "./dist/extension.js",
+  "extensionPack": ["xdebug.php-debug"],
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "lint": "tsc -p ./ --noEmit",
+    "package": "npm run compile && npx @vscode/vsce package --no-dependencies",
+    "test": "npm run lint"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/vscode": "^1.96.0",
+    "@vscode/vsce": "^3.2.2",
+    "typescript": "^5.7.2"
+  },
+  "contributes": {
+    "languages": [
+      { "id": "php", "aliases": ["PHP", "php"], "extensions": [".php", ".php3", ".php4", ".php5", ".phtml", ".inc"], "configuration": "./language-configuration.json" },
+      { "id": "blade", "aliases": ["Laravel Blade", "blade"], "extensions": [".blade.php"], "configuration": "./language-configuration.json" }
+    ],
+    "grammars": [
+      { "language": "php", "scopeName": "source.php", "path": "./syntaxes/php.tmLanguage.json" },
+      { "language": "blade", "scopeName": "text.html.php.blade", "path": "./syntaxes/blade.tmLanguage.json", "embeddedLanguages": { "text.html.basic": "html", "source.php": "php", "source.css": "css", "source.js": "javascript" } }
+    ],
+    "snippets": [
+      { "language": "php", "path": "./snippets/php.json" },
+      { "language": "blade", "path": "./snippets/blade.json" }
+    ],
+    "commands": [
+      { "command": "phpulse.reindex", "title": "Reindex Workspace", "category": "PHPulse" },
+      { "command": "phpulse.formatWorkspace", "title": "Format Workspace", "category": "PHPulse" },
+      { "command": "phpulse.startServer", "title": "Start PHP Development Server", "category": "PHPulse" },
+      { "command": "phpulse.stopServer", "title": "Stop PHP Development Server", "category": "PHPulse" },
+      { "command": "phpulse.openManual", "title": "Open PHP Manual for Symbol", "category": "PHPulse" },
+      { "command": "phpulse.runAnalysis", "title": "Analyze Workspace", "category": "PHPulse" },
+      { "command": "phpulse.generateDocblock", "title": "Generate PHPDoc", "category": "PHPulse" },
+      { "command": "phpulse.removeUnusedImports", "title": "Remove Unused Imports", "category": "PHPulse" },
+      { "command": "phpulse.composerInstall", "title": "Composer Install", "category": "PHPulse" },
+      { "command": "phpulse.createLaunchConfig", "title": "Create Debug Configuration", "category": "PHPulse" }
+    ],
+    "menus": {
+      "editor/context": [
+        { "command": "phpulse.generateDocblock", "when": "editorLangId == php", "group": "1_modification" },
+        { "command": "phpulse.openManual", "when": "editorLangId == php", "group": "navigation" }
+      ]
+    },
+    "configuration": {
+      "title": "PHPulse",
+      "properties": {
+        "phpulse.phpExecutable": { "type": "string", "default": "php", "description": "PHP executable path." },
+        "phpulse.phpVersion": { "type": "string", "default": "8.4", "enum": ["7.4", "8.0", "8.1", "8.2", "8.3", "8.4", "8.5"], "description": "Target PHP version for compatibility checks." },
+        "phpulse.diagnostics.enable": { "type": "boolean", "default": true },
+        "phpulse.diagnostics.tool": { "type": "string", "default": "auto", "enum": ["auto", "phpstan", "psalm", "none"] },
+        "phpulse.format.style": { "type": "string", "default": "PSR-12", "enum": ["PER", "PSR-12", "PSR-2", "Allman", "K&R", "Laravel", "Drupal", "WordPress"] },
+        "phpulse.format.command": { "type": "string", "default": "", "description": "Optional formatter executable (php-cs-fixer or pint)." },
+        "phpulse.inlayHints.enable": { "type": "boolean", "default": true },
+        "phpulse.codeLens.enable": { "type": "boolean", "default": true },
+        "phpulse.server.host": { "type": "string", "default": "127.0.0.1" },
+        "phpulse.server.port": { "type": "number", "default": 8000 },
+        "phpulse.server.documentRoot": { "type": "string", "default": "" },
+        "phpulse.tests.command": { "type": "string", "default": "", "description": "Override PHPUnit/Pest executable." },
+        "phpulse.tests.continuous": { "type": "boolean", "default": false },
+        "phpulse.index.exclude": { "type": "array", "default": ["**/vendor/**", "**/node_modules/**", "**/.git/**", "**/storage/**"] }
+      }
+    },
+    "configurationDefaults": {
+      "[php]": { "editor.defaultFormatter": "local.phpulse-vscode", "editor.formatOnType": true, "editor.suggest.insertMode": "replace" },
+      "[blade]": { "editor.defaultFormatter": "local.phpulse-vscode" }
+    }
+  }
+}

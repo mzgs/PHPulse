@@ -141,3 +141,7 @@ dist
 vite.config.js.timestamp-*
 vite.config.ts.timestamp-*
 .vite/
+
+# PHPulse extension packages and local OS files
+*.vsix
+.DS_Store

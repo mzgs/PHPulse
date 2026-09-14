@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/martinring/tmlanguage/master/tmlanguage.json",
+  "name": "Laravel Blade",
+  "scopeName": "text.html.php.blade",
+  "patterns": [
+    { "begin": "{{--", "end": "--}}", "name": "comment.block.blade" },
+    { "begin": "@php\\b", "end": "@endphp\\b", "name": "meta.embedded.block.php", "patterns": [{ "include": "source.php" }] },
+    { "begin": "{{{?", "end": "}}}?", "name": "meta.embedded.expression.php", "patterns": [{ "include": "source.php" }] },
+    { "begin": "{!!", "end": "!!}", "name": "meta.embedded.expression.php", "patterns": [{ "include": "source.php" }] },
+    { "match": "@[A-Za-z_][A-Za-z0-9_]*", "name": "keyword.control.blade" },
+    { "match": "(?<=<)x-[A-Za-z0-9_.:-]+", "name": "entity.name.tag.blade" },
+    { "include": "text.html.basic" }
+  ]
+}
