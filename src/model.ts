@@ -1,180 +1,137 @@
 import * as vscode from 'vscode';
+import { PhpProject, SymbolReference, matches } from './intelligence';
+import { PhpFile, SymbolKind } from './phpSyntax';
 
-export type PhpSymbolKind = 'class' | 'interface' | 'trait' | 'enum' | 'function' | 'method' | 'property' | 'constant';
-
+export type PhpSymbolKind = SymbolKind;
 export interface PhpSymbol {
-  name: string;
-  fqName: string;
-  kind: PhpSymbolKind;
-  uri: vscode.Uri;
-  range: vscode.Range;
-  selectionRange: vscode.Range;
-  namespace: string;
-  container?: string;
-  signature?: string;
-  doc?: string;
-  extends?: string[];
-  isStatic?: boolean;
+  name: string; fqName: string; kind: PhpSymbolKind; uri: vscode.Uri;
+  range: vscode.Range; selectionRange: vscode.Range; namespace: string;
+  container?: string; signature?: string; doc?: string; extends?: string[]; isStatic?: boolean;
+  type?: string;
 }
-
 const kindMap: Record<PhpSymbolKind, vscode.SymbolKind> = {
-  class: vscode.SymbolKind.Class,
-  interface: vscode.SymbolKind.Interface,
-  trait: vscode.SymbolKind.Class,
-  enum: vscode.SymbolKind.Enum,
-  function: vscode.SymbolKind.Function,
-  method: vscode.SymbolKind.Method,
-  property: vscode.SymbolKind.Property,
-  constant: vscode.SymbolKind.Constant
+  class: vscode.SymbolKind.Class, interface: vscode.SymbolKind.Interface, trait: vscode.SymbolKind.Class,
+  enum: vscode.SymbolKind.Enum, function: vscode.SymbolKind.Function, method: vscode.SymbolKind.Method,
+  property: vscode.SymbolKind.Property, constant: vscode.SymbolKind.Constant
 };
-
 export function vscodeKind(kind: PhpSymbolKind): vscode.SymbolKind { return kindMap[kind]; }
-
 export function wordRange(document: vscode.TextDocument, position: vscode.Position): vscode.Range | undefined {
   return document.getWordRangeAtPosition(position, /[A-Za-z_\\][A-Za-z0-9_\\]*/);
 }
 
+const lineOffsets = new WeakMap<PhpFile, number[]>();
+const editorSymbols = new WeakMap<SymbolReference, PhpSymbol>();
+export function symbolFor(ref: SymbolReference): PhpSymbol {
+  const cached = editorSymbols.get(ref); if (cached) return cached;
+  const d = ref.declaration;
+  let lines = lineOffsets.get(ref.file);
+  if (!lines) { lines = [0]; for (let i = 0; i < ref.file.text.length; i++) if (ref.file.text[i] === '\n') lines.push(i + 1); lineOffsets.set(ref.file, lines); }
+  const position = (offset: number) => {
+    let low = 0, high = lines!.length;
+    while (low + 1 < high) { const mid = (low + high) >>> 1; if (lines![mid] <= offset) low = mid; else high = mid; }
+    return new vscode.Position(low, offset - lines![low]);
+  };
+  const symbol = { name: d.name, fqName: d.fqName, kind: d.kind, uri: vscode.Uri.parse(ref.uri),
+    range: new vscode.Range(position(d.start), position(d.end)), selectionRange: new vscode.Range(position(d.nameStart), position(d.nameStart + d.name.length)),
+    namespace: d.namespace, container: d.owner?.split('\\').pop(), signature: d.signature, doc: d.doc,
+    extends: d.parents, isStatic: d.isStatic, type: d.type };
+  editorSymbols.set(ref, symbol); return symbol;
+}
+
 export class PhpIndex implements vscode.Disposable {
-  private readonly byUri = new Map<string, PhpSymbol[]>();
-  private symbols: PhpSymbol[] = [];
-  private readonly byName = new Map<string, PhpSymbol[]>();
+  readonly project = new PhpProject();
+  private symbols?: PhpSymbol[];
+  private readonly documentVersions = new WeakMap<vscode.TextDocument, number>();
   private readonly disposables: vscode.Disposable[] = [];
-  private refreshTimer?: NodeJS.Timeout;
+  private readonly refreshTimers = new Map<string, NodeJS.Timeout>();
   private readonly changedEmitter = new vscode.EventEmitter<void>();
+  private disposed = false;
   readonly onDidChange = this.changedEmitter.event;
 
   constructor() {
-    this.disposables.push(
+    const watcher = vscode.workspace.createFileSystemWatcher('**/*.{php,phtml,inc}');
+    const refresh = async (uri: vscode.Uri) => {
+      // Open buffers are authoritative, including unsaved edits.
+      const open = vscode.workspace.textDocuments.find(d => d.uri.toString() === uri.toString());
+      if (open) { this.update(open); return; }
+      if (!this.project.files.has(uri.toString())) {
+        const exclude = vscode.workspace.getConfiguration('phpulse.index').get<string[]>('exclude', []);
+        const included = await vscode.workspace.findFiles(new vscode.RelativePattern(vscode.Uri.joinPath(uri, '..'), uri.path.split('/').pop()!), exclude.length ? `{${exclude.join(',')}}` : undefined, 1);
+        if (!included.length) return;
+      }
+      try {
+        const text = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+        if (!this.disposed && !vscode.workspace.textDocuments.some(d => d.uri.toString() === uri.toString())) this.updateSource(uri.toString(), text);
+      } catch { /* Deleted or unreadable file. */ }
+    };
+    this.disposables.push(watcher,
+      watcher.onDidCreate(refresh), watcher.onDidChange(refresh),
+      watcher.onDidDelete(uri => { if (this.project.remove(uri.toString())) this.changed(); }),
       vscode.workspace.onDidOpenTextDocument(d => this.update(d)),
       vscode.workspace.onDidChangeTextDocument(e => this.schedule(e.document)),
       vscode.workspace.onDidSaveTextDocument(d => this.update(d)),
-      vscode.workspace.onDidDeleteFiles(e => { for (const uri of e.files) this.byUri.delete(uri.toString()); this.rebuildLookups(); })
+      vscode.workspace.onDidCloseTextDocument(d => { const timer = this.refreshTimers.get(d.uri.toString()); if (timer) clearTimeout(timer); this.refreshTimers.delete(d.uri.toString()); void refresh(d.uri); })
     );
   }
-
   async initialize(): Promise<void> {
     const exclude = vscode.workspace.getConfiguration('phpulse.index').get<string[]>('exclude', []);
-    const files = await vscode.workspace.findFiles('**/*.{php,phtml,inc}', `{${exclude.join(',')}}`, 15000);
-    const batch = 100;
-    for (let i = 0; i < files.length; i += batch) {
-      await Promise.all(files.slice(i, i + batch).map(async uri => {
-        try { this.byUri.set(uri.toString(), parsePhp(uri, (await vscode.workspace.fs.readFile(uri)).toString())); } catch { /* unreadable */ }
+    const files = await vscode.workspace.findFiles('**/*.{php,phtml,inc}', exclude.length ? `{${exclude.join(',')}}` : undefined, 15000);
+    const retained = new Set([...files.map(u => u.toString()), ...vscode.workspace.textDocuments.map(d => d.uri.toString())]);
+    for (const uri of this.project.files.keys()) if (!retained.has(uri)) this.project.remove(uri);
+    for (let i = 0; i < files.length && !this.disposed; i += 100) {
+      await Promise.all(files.slice(i, i + 100).map(async uri => {
+        try {
+          const text = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
+          const open = vscode.workspace.textDocuments.find(d => d.uri.toString() === uri.toString());
+          if (!this.disposed) this.project.update(uri.toString(), open?.getText() ?? text);
+        } catch { /* Unreadable file. */ }
       }));
     }
-    this.rebuildLookups();
+    for (const d of vscode.workspace.textDocuments) if (this.accepts(d)) this.project.update(d.uri.toString(), d.getText());
+    this.changed();
   }
-
+  private accepts(d: vscode.TextDocument): boolean { return ['php', 'blade'].includes(d.languageId) || /\.(php|phtml|inc)$/.test(d.fileName); }
   update(document: vscode.TextDocument): void {
-    if (!['php', 'blade'].includes(document.languageId) && !document.fileName.endsWith('.php')) return;
-    this.byUri.set(document.uri.toString(), parsePhp(document.uri, document.getText()));
-    this.rebuildLookups();
+    if (this.disposed || !this.accepts(document)) return;
+    const uri = document.uri.toString();
+    if (document.version !== undefined && this.documentVersions.get(document) === document.version && this.project.files.has(uri)) return;
+    this.updateSource(uri, document.getText());
+    if (document.version !== undefined) this.documentVersions.set(document, document.version);
   }
-
+  private updateSource(uri: string, text: string): void {
+    if (this.project.files.get(uri)?.text === text) return;
+    this.project.update(uri, text); this.changed();
+  }
+  current(document: vscode.TextDocument): PhpFile { this.update(document); return this.project.files.get(document.uri.toString())!; }
   private schedule(document: vscode.TextDocument): void {
-    if (this.refreshTimer) clearTimeout(this.refreshTimer);
-    this.refreshTimer = setTimeout(() => this.update(document), 250);
+    if (!this.accepts(document)) return;
+    const key = document.uri.toString(), timer = this.refreshTimers.get(key);
+    if (timer) clearTimeout(timer);
+    this.refreshTimers.set(key, setTimeout(() => { this.refreshTimers.delete(key); this.update(document); }, 150));
   }
-
-  all(): PhpSymbol[] { return this.symbols; }
-  forDocument(uri: vscode.Uri): PhpSymbol[] { return this.byUri.get(uri.toString()) ?? []; }
+  all(): PhpSymbol[] { return this.symbols ??= this.project.all().map(symbolFor); }
+  forDocument(uri: vscode.Uri): PhpSymbol[] { return this.project.forDocument(uri.toString()).map(symbolFor); }
   named(name: string): PhpSymbol[] {
-    const normalized = name.replace(/^\\/, '').toLowerCase();
-    const simple = normalized.split('\\').pop() ?? normalized;
-    const candidates = this.byName.get(simple) ?? [];
-    return candidates.filter(s => s.fqName.toLowerCase() === normalized || s.name.toLowerCase() === simple);
+    return this.project.named(name).map(symbolFor);
   }
   completionCandidates(query: string, kinds?: ReadonlySet<PhpSymbolKind>, limit = 300): PhpSymbol[] {
-    const needle = query.replace(/^\\/, '').toLowerCase();
-    const result: PhpSymbol[] = [];
-    for (const symbol of this.symbols) {
-      if (kinds && !kinds.has(symbol.kind)) continue;
-      if (needle && !symbol.name.toLowerCase().startsWith(needle) && !symbol.fqName.toLowerCase().includes(needle)) continue;
-      result.push(symbol);
-      if (result.length >= limit) break;
-    }
-    return result;
+    return this.project.all().filter(r => (!kinds || kinds.has(r.declaration.kind)) && (matches(r.declaration.name, query) || r.declaration.fqName.toLowerCase().startsWith(query.replace(/^\\/, '').toLowerCase()))).slice(0, limit).map(symbolFor);
   }
   membersOf(typeName: string, query = '', limit = 300): PhpSymbol[] {
-    const normalized = typeName.replace(/^\\/, '').toLowerCase();
-    const simple = normalized.split('\\').pop() ?? normalized;
-    const needle = query.toLowerCase();
-    return this.symbols.filter(s => {
-      if (!['method', 'property', 'constant'].includes(s.kind) || !s.container) return false;
-      const owner = s.fqName.slice(0, s.fqName.lastIndexOf('::')).toLowerCase();
-      if (owner !== normalized && s.container.toLowerCase() !== simple) return false;
-      return !needle || s.name.toLowerCase().startsWith(needle);
-    }).slice(0, limit);
+    return this.project.membersOf(typeName, typeName).filter(r => matches(r.declaration.name, query)).slice(0, limit).map(symbolFor);
   }
   derivedFrom(name: string): PhpSymbol[] {
-    const needle = name.replace(/^\\/, '').toLowerCase();
-    return this.all().filter(s => s.extends?.some(e => e.replace(/^\\/, '').toLowerCase() === needle || e.split('\\').pop()?.toLowerCase() === needle.split('\\').pop()));
+    const targets = this.named(name).filter(s => ['class', 'interface', 'trait'].includes(s.kind)).map(s => s.fqName);
+    return this.project.all().filter(r => r.declaration.parents.some(p => targets.some(t => t.toLowerCase() === p.toLowerCase()))).map(symbolFor);
   }
-  private rebuildLookups(): void {
-    this.symbols = [...this.byUri.values()].flat();
-    this.byName.clear();
-    for (const symbol of this.symbols) {
-      const key = symbol.name.toLowerCase();
-      const values = this.byName.get(key);
-      if (values) values.push(symbol); else this.byName.set(key, [symbol]);
-    }
+  private changed(): void {
+    if (this.disposed) return;
+    this.symbols = undefined;
     this.changedEmitter.fire();
   }
-  dispose(): void { if (this.refreshTimer) clearTimeout(this.refreshTimer); this.changedEmitter.dispose(); this.disposables.forEach(d => d.dispose()); }
+  dispose(): void { this.disposed = true; this.refreshTimers.forEach(clearTimeout); this.refreshTimers.clear(); this.changedEmitter.dispose(); this.disposables.forEach(d => d.dispose()); }
 }
 
 export function parsePhp(uri: vscode.Uri, text: string): PhpSymbol[] {
-  const symbols: PhpSymbol[] = [];
-  const lines = text.split(/\r?\n/);
-  let namespace = '';
-  let currentType: { name: string; depth: number } | undefined;
-  let depth = 0;
-  let pendingDoc = '';
-  let inDoc = false;
-
-  const add = (name: string, kind: PhpSymbolKind, line: number, start: number, signature?: string, ext?: string[], isStatic?: boolean) => {
-    const container = currentType?.name;
-    const fqName = kind === 'method' || kind === 'property' || kind === 'constant'
-      ? `${namespace ? namespace + '\\' : ''}${container ?? ''}::${name}`
-      : `${namespace ? namespace + '\\' : ''}${name}`;
-    const selectionRange = new vscode.Range(line, start, line, start + name.length);
-    symbols.push({ name, fqName, kind, uri, range: new vscode.Range(line, 0, line, lines[line].length), selectionRange, namespace, container, signature, doc: pendingDoc, extends: ext, isStatic });
-    pendingDoc = '';
-  };
-
-  lines.forEach((line, lineNo) => {
-    if (/^\s*\/\*\*/.test(line)) { inDoc = true; pendingDoc = line.trim(); }
-    else if (inDoc) pendingDoc += `\n${line.trim()}`;
-    if (inDoc && /\*\//.test(line)) inDoc = false;
-    if (inDoc) return;
-
-    const ns = line.match(/^\s*namespace\s+([^;{]+)/);
-    if (ns) namespace = ns[1].trim();
-
-    const type = line.match(/\b(class|interface|trait|enum)\s+([A-Za-z_]\w*)([^\{]*)/);
-    if (type && !/::class\b/.test(line)) {
-      const kind = type[1] as PhpSymbolKind;
-      const parents = [...type[3].matchAll(/(?:extends|implements|,)\s*([\\A-Za-z_]\w*(?:\\[A-Za-z_]\w*)*)/g)].map(m => m[1]);
-      add(type[2], kind, lineNo, line.indexOf(type[2]), line.trim(), parents);
-      currentType = { name: type[2], depth: depth + (line.includes('{') ? 1 : 0) };
-    }
-
-    const fn = line.match(/\bfunction\s+&?\s*([A-Za-z_]\w*)\s*(\([^)]*\)(?:\s*:\s*[^\s{;]+)?)/);
-    if (fn) {
-      const declarationPrefix = line.slice(0, fn.index);
-      add(fn[1], currentType ? 'method' : 'function', lineNo, line.indexOf(fn[1]), `${fn[1]}${fn[2]}`, undefined, /\bstatic\b/.test(declarationPrefix));
-    }
-
-    if (currentType) {
-      for (const m of line.matchAll(/(?:public|protected|private|static|readonly|var|\s)+\s*(?:[?\\A-Za-z_|&][\\A-Za-z0-9_|&?]*\s+)?\$([A-Za-z_]\w*)/g)) {
-        add(m[1], 'property', lineNo, line.indexOf(m[1], m.index));
-      }
-      const c = line.match(/\bconst\s+(?:[A-Za-z_|?]+\s+)?([A-Za-z_]\w*)/);
-      if (c) add(c[1], 'constant', lineNo, line.indexOf(c[1]));
-    }
-
-    depth += (line.match(/\{/g) ?? []).length - (line.match(/\}/g) ?? []).length;
-    if (currentType && depth < currentType.depth) currentType = undefined;
-    if (!line.trim().startsWith('*') && !/^\s*(?:#\[|\/\/|#)/.test(line) && line.trim() && !type && !fn) pendingDoc = '';
-  });
-  return symbols;
+  const project = new PhpProject(); project.update(uri.toString(), text); return project.all().map(symbolFor);
 }

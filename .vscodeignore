@@ -1,6 +1,8 @@
 .git/**
 .vscode/**
 src/**
+test/**
+benchmark/**
 node_modules/@types/**
 node_modules/typescript/**
 tsconfig.json

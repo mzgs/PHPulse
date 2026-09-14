@@ -1,5 +1,6 @@
 import * as vscode from 'vscode';
 import { PhpIndex, PhpSymbol, vscodeKind, wordRange } from './model';
+import { completePhp, resolvedSymbols, signatureHelp } from './completion';
 
 const keywords = ['abstract','and','array','as','break','callable','case','catch','class','clone','const','continue','declare','default','do','echo','else','elseif','empty','enddeclare','endfor','endforeach','endif','endswitch','endwhile','enum','eval','exit','extends','final','finally','fn','for','foreach','function','global','goto','if','implements','include','include_once','instanceof','insteadof','interface','isset','list','match','namespace','new','or','print','private','protected','public','readonly','require','require_once','return','static','switch','throw','trait','try','unset','use','var','while','xor','yield'];
 
@@ -18,125 +19,18 @@ const builtins: Record<string, { signature: string; description: string }> = {
   var_dump: { signature: 'var_dump(mixed $value, mixed ...$values): void', description: 'Dumps information about a variable.' }
 };
 
-const completionRank = {
-  variable: '0',
-  userFunction: '1',
-  userType: '2',
-  otherUserSymbol: '3',
-  builtinFunction: '4',
-  keyword: '5',
-  phpDocTag: '6'
-} as const;
-
-function rankedSortText(rank: string, label: string): string {
-  return `${rank}_${label.toLowerCase()}`;
-}
-
-function itemFor(s: PhpSymbol): vscode.CompletionItem {
-  const kinds: Record<string, vscode.CompletionItemKind> = { class: vscode.CompletionItemKind.Class, interface: vscode.CompletionItemKind.Interface, trait: vscode.CompletionItemKind.Class, enum: vscode.CompletionItemKind.Enum, function: vscode.CompletionItemKind.Function, method: vscode.CompletionItemKind.Method, property: vscode.CompletionItemKind.Property, constant: vscode.CompletionItemKind.Constant };
-  const item = new vscode.CompletionItem(s.name, kinds[s.kind]);
-  item.detail = `${s.kind} ${s.fqName}${s.signature ? ` — ${s.signature}` : ''}`;
-  item.documentation = s.doc ? new vscode.MarkdownString(`\`\`\`php\n${s.doc}\n\`\`\``) : undefined;
-  const rank = s.kind === 'function'
-    ? completionRank.userFunction
-    : ['class', 'interface', 'trait', 'enum'].includes(s.kind)
-      ? completionRank.userType
-      : completionRank.otherUserSymbol;
-  item.sortText = rankedSortText(rank, s.name);
-  if (s.kind === 'function' || s.kind === 'method') item.insertText = new vscode.SnippetString(`${s.name}($0)`);
-  return item;
-}
-
 export function registerLanguageFeatures(context: vscode.ExtensionContext, index: PhpIndex): void {
   const selector: vscode.DocumentSelector = [{ language: 'php' }, { language: 'blade' }];
 
   context.subscriptions.push(vscode.languages.registerCompletionItemProvider(selector, {
-    provideCompletionItems(document, position) {
-      const line = document.lineAt(position).text.slice(0, position.character);
-      const member = line.match(/(?:\$([A-Za-z_]\w*)|([\\A-Za-z_]\w*(?:\\[A-Za-z_]\w*)*))\s*(->|::)\s*([A-Za-z_]\w*)?$/);
-      if (member) {
-        const typeName = member[2] || inferVariableType(document, position, member[1]);
-        const staticAccess = member[3] === '::';
-        const memberKinds = new Set<PhpSymbol['kind']>(staticAccess ? ['method', 'constant'] : ['method', 'property']);
-        const candidates = (typeName
-          ? index.membersOf(resolveTypeName(document, typeName, position), member[4] ?? '')
-          : index.completionCandidates(member[4] ?? '', memberKinds))
-          .filter(s => staticAccess ? s.kind === 'constant' || s.isStatic : s.kind !== 'constant');
-        return new vscode.CompletionList(candidates.map(itemFor), candidates.length >= 300);
-      }
-
-      const word = line.match(/[\\A-Za-z_]\w*(?:\\[A-Za-z_]\w*)*$/)?.[0] ?? '';
-      const typeContext = /\b(new|extends|implements|instanceof|use)\s+[\\\w]*$/.test(line);
-      const globalKinds = new Set<PhpSymbol['kind']>(typeContext
-        ? ['class', 'interface', 'trait', 'enum']
-        : ['class', 'interface', 'trait', 'enum', 'function', 'constant']);
-      const symbols = index.completionCandidates(word, globalKinds);
-      const source = document.getText();
-      const items: vscode.CompletionItem[] = symbols.map(s => {
-        const item = itemFor(s);
-        if (document.languageId === 'php' && ['class', 'interface', 'trait', 'enum'].includes(s.kind) && s.uri.toString() !== document.uri.toString()) {
-          const ns = source.match(/^\s*namespace\s+([^;{]+)/m)?.[1].trim() ?? '';
-          if (s.namespace && s.namespace !== ns && !new RegExp(`^\\s*use\\s+${escapeRegExp(s.fqName)}\\s*;`, 'm').test(source)) {
-            const insert = importPosition(document);
-            const prefix = insert.line === 0 && insert.character === 0
-              ? (source.includes('<?php') ? '' : '<?php\n\n')
-              : '\n';
-            item.additionalTextEdits = [vscode.TextEdit.insert(insert, `${prefix}use ${s.fqName};\n`)];
-            item.detail = `${item.detail} (auto-import)`;
-          }
-        }
-        return item;
-      });
-      const enclosingType = !typeContext ? enclosingTypeName(document, position) : undefined;
-      if (enclosingType) {
-        const typeName = resolveTypeName(document, enclosingType, position);
-        for (const method of index.membersOf(typeName, word).filter(s => s.kind === 'method' && s.isStatic)) {
-          const owner = method.container ?? enclosingType;
-          const item = itemFor(method);
-          item.label = `${owner}::${method.name}()`;
-          item.filterText = word || method.name;
-          item.insertText = new vscode.SnippetString(`${owner}::${method.name}($0)`);
-          item.sortText = rankedSortText(completionRank.userFunction, method.name);
-          items.push(item);
-        }
-      }
-      const localText = document.getText(new vscode.Range(new vscode.Position(0, 0), position));
-      for (const variable of new Set([...localText.matchAll(/\$([A-Za-z_]\w*)/g)].map(m => m[1]))) {
-        const item = new vscode.CompletionItem(`$${variable}`, vscode.CompletionItemKind.Variable);
-        // Match against the identifier itself so typing "fil" gives "$filters"
-        // the same prefix-match score as functions and keywords without a "$".
-        item.filterText = variable;
-        item.sortText = rankedSortText(completionRank.variable, variable);
-        items.push(item);
-      }
-      for (const keyword of keywords) {
-        if (word && !keyword.startsWith(word.toLowerCase())) continue;
-        const item = new vscode.CompletionItem(keyword, vscode.CompletionItemKind.Keyword);
-        item.sortText = rankedSortText(completionRank.keyword, keyword);
-        items.push(item);
-      }
-      for (const [name, info] of Object.entries(builtins)) {
-        if (word && !name.startsWith(word.toLowerCase())) continue;
-        const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Function);
-        item.detail = info.signature; item.documentation = new vscode.MarkdownString(`${info.description}\n\n[PHP manual](https://www.php.net/${name})`);
-        item.sortText = rankedSortText(completionRank.builtinFunction, name);
-        items.push(item);
-      }
-      for (const tag of ['@param','@return','@throws','@var','@property','@property-read','@method','@template','@extends','@implements','@mixin','@deprecated','@see']) {
-        const item = new vscode.CompletionItem(tag, vscode.CompletionItemKind.Keyword);
-        item.sortText = rankedSortText(completionRank.phpDocTag, tag);
-        items.push(item);
-      }
-      if (typeContext) return new vscode.CompletionList(items.filter(i => [vscode.CompletionItemKind.Class, vscode.CompletionItemKind.Interface, vscode.CompletionItemKind.Enum].includes(i.kind!)), symbols.length >= 300);
-      return new vscode.CompletionList(items, symbols.length >= 300);
-    }
+    provideCompletionItems(document, position, token) { return completePhp(index, document, position, keywords, builtins, token); }
   }, '$', '>', ':', '\\', '@'));
 
   context.subscriptions.push(vscode.languages.registerHoverProvider(selector, {
     provideHover(document, position) {
       const range = wordRange(document, position); if (!range) return;
       const word = document.getText(range).replace(/^\\/, '');
-      const found = index.named(word)[0];
+      const found = resolvedSymbols(index, document, position)[0];
       if (found) {
         const md = new vscode.MarkdownString(); md.appendCodeblock(found.signature ?? `${found.kind} ${found.fqName}`, 'php');
         if (found.doc) md.appendMarkdown(`\n${found.doc.replace(/^\s*\/\*\*|\*\/$/g, '')}`);
@@ -148,7 +42,7 @@ export function registerLanguageFeatures(context: vscode.ExtensionContext, index
   }));
 
   context.subscriptions.push(vscode.languages.registerDefinitionProvider(selector, {
-    provideDefinition(document, position) { const r = wordRange(document, position); return r ? index.named(document.getText(r)).map(s => new vscode.Location(s.uri, s.selectionRange)) : []; }
+    provideDefinition(document, position) { return resolvedSymbols(index, document, position).map(s => new vscode.Location(s.uri, s.selectionRange)); }
   }));
   context.subscriptions.push(vscode.languages.registerImplementationProvider(selector, {
     provideImplementation(document, position) { const r = wordRange(document, position); if (!r) return []; const name = document.getText(r); return [...index.named(name).filter(s => s.kind === 'method'), ...index.derivedFrom(name)].map(s => new vscode.Location(s.uri, s.selectionRange)); }
@@ -178,14 +72,7 @@ export function registerLanguageFeatures(context: vscode.ExtensionContext, index
   }));
 
   context.subscriptions.push(vscode.languages.registerSignatureHelpProvider(selector, {
-    provideSignatureHelp(document, position) {
-      const prefix = document.getText(new vscode.Range(new vscode.Position(Math.max(0, position.line - 20), 0), position));
-      const match = prefix.match(/([A-Za-z_]\w*)\s*\(([^()]*)$/); if (!match) return;
-      const sig = index.named(match[1]).find(s => s.signature)?.signature ?? builtins[match[1].toLowerCase()]?.signature; if (!sig) return;
-      const help = new vscode.SignatureHelp(); const label = sig;
-      const si = new vscode.SignatureInformation(label); const params = label.slice(label.indexOf('(') + 1, label.lastIndexOf(')')).split(',').filter(Boolean);
-      si.parameters = params.map(p => new vscode.ParameterInformation(p.trim())); help.signatures = [si]; help.activeSignature = 0; help.activeParameter = Math.min(params.length - 1, (match[2].match(/,/g) ?? []).length); return help;
-    }
+    provideSignatureHelp(document, position) { return signatureHelp(index, document, position, builtins); }
   }, '(', ','));
 
   context.subscriptions.push(vscode.languages.registerFoldingRangeProvider(selector, {
@@ -207,74 +94,6 @@ export function registerLanguageFeatures(context: vscode.ExtensionContext, index
   context.subscriptions.push(vscode.languages.registerInlayHintsProvider(selector, new PhpInlayHints(index)));
   context.subscriptions.push(vscode.languages.registerTypeHierarchyProvider(selector, new PhpTypeHierarchy(index)));
   context.subscriptions.push(vscode.languages.registerCallHierarchyProvider(selector, new PhpCallHierarchy(index)));
-}
-
-function resolveTypeName(document: vscode.TextDocument, name: string, position?: vscode.Position): string {
-  const clean = name.replace(/^\?/, '').replace(/^\\/, '');
-  if (name.startsWith('\\')) return clean;
-  if (/^(?:self|static)$/i.test(clean) && position) {
-    const enclosing = enclosingTypeName(document, position);
-    if (enclosing) return resolveTypeName(document, enclosing);
-  }
-  const imports = [...document.getText().matchAll(/^\s*use\s+(?!function\s|const\s)([^;]+);/gm)];
-  for (const match of imports) {
-    const imported = match[1].trim();
-    const alias = imported.match(/\s+as\s+([A-Za-z_]\w*)$/i)?.[1] ?? imported.split('\\').pop();
-    if (alias?.toLowerCase() === clean.toLowerCase()) return imported.replace(/\s+as\s+\w+$/i, '');
-  }
-  const namespace = document.getText().match(/^\s*namespace\s+([^;{]+)/m)?.[1].trim();
-  return namespace ? `${namespace}\\${clean}` : clean;
-}
-
-function enclosingTypeName(document: vscode.TextDocument, position: vscode.Position): string | undefined {
-  const before = document.getText(new vscode.Range(new vscode.Position(0, 0), position));
-  const declarations = [...before.matchAll(/\b(?:class|interface|trait|enum)\s+([A-Za-z_]\w*)[^\{]*/g)];
-  for (let i = declarations.length - 1; i >= 0; i--) {
-    const declaration = declarations[i];
-    const openBrace = before.indexOf('{', declaration.index! + declaration[0].length);
-    if (openBrace < 0) continue;
-    const body = before.slice(openBrace);
-    const depth = (body.match(/\{/g) ?? []).length - (body.match(/\}/g) ?? []).length;
-    if (depth > 0) return declaration[1];
-  }
-  return undefined;
-}
-
-function inferVariableType(document: vscode.TextDocument, position: vscode.Position, variable: string): string | undefined {
-  const before = document.getText(new vscode.Range(new vscode.Position(0, 0), position));
-  if (variable === 'this') {
-    const classes = [...before.matchAll(/\b(?:class|interface|trait|enum)\s+([A-Za-z_]\w*)/g)];
-    return classes.at(-1)?.[1];
-  }
-  const escaped = escapeRegExp(variable);
-  const patterns = [
-    new RegExp(`\\$${escaped}\\s*=\\s*new\\s+([\\\\A-Za-z_]\\w*(?:\\\\[A-Za-z_]\\w*)*)`, 'g'),
-    new RegExp(`([?\\\\A-Za-z_]\\w*(?:\\\\[A-Za-z_]\\w*)*)\\s+\\$${escaped}\\b`, 'g'),
-    new RegExp(`@var\\s+([\\\\A-Za-z_]\\w*(?:\\\\[A-Za-z_]\\w*)*)\\s+\\$${escaped}\\b`, 'g'),
-    new RegExp(`@var\\s+\\$${escaped}\\s+([\\\\A-Za-z_]\\w*(?:\\\\[A-Za-z_]\\w*)*)`, 'g')
-  ];
-  for (const pattern of patterns) {
-    const matches = [...before.matchAll(pattern)];
-    const found = matches.at(-1)?.[1];
-    if (found) return found.replace(/^\?/, '');
-  }
-  return undefined;
-}
-
-function importPosition(document: vscode.TextDocument): vscode.Position {
-  const text = document.getText();
-  const patterns = [
-    /^\s*use\s+(?:function\s+|const\s+)?[^;]+;[^\S\r\n]*$/gm,
-    /^\s*namespace\s+[^;{]+;[^\S\r\n]*$/gm,
-    /^\s*declare\s*\([^;]+;[^\S\r\n]*$/gm,
-    /<\?php[^\S\r\n]*$/gm
-  ];
-  for (const pattern of patterns) {
-    const matches = [...text.matchAll(pattern)];
-    const match = matches.at(-1);
-    if (match?.index !== undefined) return document.positionAt(match.index + match[0].length);
-  }
-  return new vscode.Position(0, 0);
 }
 
 async function findReferences(name: string, includeDeclaration: boolean, token: vscode.CancellationToken): Promise<vscode.Location[]> {

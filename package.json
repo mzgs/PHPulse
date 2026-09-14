@@ -24,7 +24,8 @@
     "watch": "tsc -watch -p ./",
     "lint": "tsc -p ./ --noEmit",
     "package": "npm run compile && npx @vscode/vsce package --no-dependencies",
-    "test": "npm run lint"
+    "test": "npm run compile && node --test test/*.test.cjs",
+    "benchmark": "npm run compile && node benchmark/intellisense.cjs"
   },
   "devDependencies": {
     "@types/node": "^22.10.2",
@@ -79,7 +80,7 @@
         "phpulse.server.documentRoot": { "type": "string", "default": "" },
         "phpulse.tests.command": { "type": "string", "default": "", "description": "Override PHPUnit/Pest executable." },
         "phpulse.tests.continuous": { "type": "boolean", "default": false },
-        "phpulse.index.exclude": { "type": "array", "default": ["**/vendor/**", "**/node_modules/**", "**/.git/**", "**/storage/**"] }
+        "phpulse.index.exclude": { "type": "array", "default": ["**/node_modules/**", "**/.git/**", "**/storage/**"], "description": "Glob patterns excluded from PHP indexing. Composer vendor sources are indexed by default; add **/vendor/** to exclude dependencies." }
       }
     },
     "configurationDefaults": {
