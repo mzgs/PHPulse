@@ -35,6 +35,8 @@ export function wordRange(document: vscode.TextDocument, position: vscode.Positi
 
 export class PhpIndex implements vscode.Disposable {
   private readonly byUri = new Map<string, PhpSymbol[]>();
+  private symbols: PhpSymbol[] = [];
+  private readonly byName = new Map<string, PhpSymbol[]>();
   private readonly disposables: vscode.Disposable[] = [];
   private refreshTimer?: NodeJS.Timeout;
   private readonly changedEmitter = new vscode.EventEmitter<void>();
@@ -45,7 +47,7 @@ export class PhpIndex implements vscode.Disposable {
       vscode.workspace.onDidOpenTextDocument(d => this.update(d)),
       vscode.workspace.onDidChangeTextDocument(e => this.schedule(e.document)),
       vscode.workspace.onDidSaveTextDocument(d => this.update(d)),
-      vscode.workspace.onDidDeleteFiles(e => { for (const uri of e.files) this.byUri.delete(uri.toString()); this.changedEmitter.fire(); })
+      vscode.workspace.onDidDeleteFiles(e => { for (const uri of e.files) this.byUri.delete(uri.toString()); this.rebuildLookups(); })
     );
   }
 
@@ -58,13 +60,13 @@ export class PhpIndex implements vscode.Disposable {
         try { this.byUri.set(uri.toString(), parsePhp(uri, (await vscode.workspace.fs.readFile(uri)).toString())); } catch { /* unreadable */ }
       }));
     }
-    this.changedEmitter.fire();
+    this.rebuildLookups();
   }
 
   update(document: vscode.TextDocument): void {
     if (!['php', 'blade'].includes(document.languageId) && !document.fileName.endsWith('.php')) return;
     this.byUri.set(document.uri.toString(), parsePhp(document.uri, document.getText()));
-    this.changedEmitter.fire();
+    this.rebuildLookups();
   }
 
   private schedule(document: vscode.TextDocument): void {
@@ -72,15 +74,49 @@ export class PhpIndex implements vscode.Disposable {
     this.refreshTimer = setTimeout(() => this.update(document), 250);
   }
 
-  all(): PhpSymbol[] { return [...this.byUri.values()].flat(); }
+  all(): PhpSymbol[] { return this.symbols; }
   forDocument(uri: vscode.Uri): PhpSymbol[] { return this.byUri.get(uri.toString()) ?? []; }
   named(name: string): PhpSymbol[] {
-    const simple = name.replace(/^\\/, '').split('\\').pop()?.toLowerCase();
-    return this.all().filter(s => s.name.toLowerCase() === simple || s.fqName.toLowerCase() === name.replace(/^\\/, '').toLowerCase());
+    const normalized = name.replace(/^\\/, '').toLowerCase();
+    const simple = normalized.split('\\').pop() ?? normalized;
+    const candidates = this.byName.get(simple) ?? [];
+    return candidates.filter(s => s.fqName.toLowerCase() === normalized || s.name.toLowerCase() === simple);
+  }
+  completionCandidates(query: string, kinds?: ReadonlySet<PhpSymbolKind>, limit = 300): PhpSymbol[] {
+    const needle = query.replace(/^\\/, '').toLowerCase();
+    const result: PhpSymbol[] = [];
+    for (const symbol of this.symbols) {
+      if (kinds && !kinds.has(symbol.kind)) continue;
+      if (needle && !symbol.name.toLowerCase().startsWith(needle) && !symbol.fqName.toLowerCase().includes(needle)) continue;
+      result.push(symbol);
+      if (result.length >= limit) break;
+    }
+    return result;
+  }
+  membersOf(typeName: string, query = '', limit = 300): PhpSymbol[] {
+    const normalized = typeName.replace(/^\\/, '').toLowerCase();
+    const simple = normalized.split('\\').pop() ?? normalized;
+    const needle = query.toLowerCase();
+    return this.symbols.filter(s => {
+      if (!['method', 'property', 'constant'].includes(s.kind) || !s.container) return false;
+      const owner = s.fqName.slice(0, s.fqName.lastIndexOf('::')).toLowerCase();
+      if (owner !== normalized && s.container.toLowerCase() !== simple) return false;
+      return !needle || s.name.toLowerCase().startsWith(needle);
+    }).slice(0, limit);
   }
   derivedFrom(name: string): PhpSymbol[] {
     const needle = name.replace(/^\\/, '').toLowerCase();
     return this.all().filter(s => s.extends?.some(e => e.replace(/^\\/, '').toLowerCase() === needle || e.split('\\').pop()?.toLowerCase() === needle.split('\\').pop()));
+  }
+  private rebuildLookups(): void {
+    this.symbols = [...this.byUri.values()].flat();
+    this.byName.clear();
+    for (const symbol of this.symbols) {
+      const key = symbol.name.toLowerCase();
+      const values = this.byName.get(key);
+      if (values) values.push(symbol); else this.byName.set(key, [symbol]);
+    }
+    this.changedEmitter.fire();
   }
   dispose(): void { if (this.refreshTimer) clearTimeout(this.refreshTimer); this.changedEmitter.dispose(); this.disposables.forEach(d => d.dispose()); }
 }

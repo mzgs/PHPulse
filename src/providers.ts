@@ -24,6 +24,7 @@ function itemFor(s: PhpSymbol): vscode.CompletionItem {
   item.detail = `${s.kind} ${s.fqName}${s.signature ? ` — ${s.signature}` : ''}`;
   item.documentation = s.doc ? new vscode.MarkdownString(`\`\`\`php\n${s.doc}\n\`\`\``) : undefined;
   item.sortText = s.uri.scheme === 'file' ? `1_${s.name}` : `2_${s.name}`;
+  if (s.kind === 'function' || s.kind === 'method') item.insertText = new vscode.SnippetString(`${s.name}($0)`);
   return item;
 }
 
@@ -33,14 +34,35 @@ export function registerLanguageFeatures(context: vscode.ExtensionContext, index
   context.subscriptions.push(vscode.languages.registerCompletionItemProvider(selector, {
     provideCompletionItems(document, position) {
       const line = document.lineAt(position).text.slice(0, position.character);
-      const items: vscode.CompletionItem[] = index.all().map(s => {
+      const member = line.match(/(?:\$([A-Za-z_]\w*)|([\\A-Za-z_]\w*(?:\\[A-Za-z_]\w*)*))\s*(->|::)\s*([A-Za-z_]\w*)?$/);
+      if (member) {
+        const typeName = member[2] || inferVariableType(document, position, member[1]);
+        const staticAccess = member[3] === '::';
+        const memberKinds = new Set<PhpSymbol['kind']>(staticAccess ? ['method', 'constant'] : ['method', 'property']);
+        const candidates = (typeName
+          ? index.membersOf(resolveTypeName(document, typeName), member[4] ?? '')
+          : index.completionCandidates(member[4] ?? '', memberKinds))
+          .filter(s => staticAccess ? s.kind !== 'property' : s.kind !== 'constant');
+        return new vscode.CompletionList(candidates.map(itemFor), candidates.length >= 300);
+      }
+
+      const word = line.match(/[\\A-Za-z_]\w*(?:\\[A-Za-z_]\w*)*$/)?.[0] ?? '';
+      const typeContext = /\b(new|extends|implements|instanceof|use)\s+[\\\w]*$/.test(line);
+      const globalKinds = new Set<PhpSymbol['kind']>(typeContext
+        ? ['class', 'interface', 'trait', 'enum']
+        : ['class', 'interface', 'trait', 'enum', 'function', 'constant']);
+      const symbols = index.completionCandidates(word, globalKinds);
+      const source = document.getText();
+      const items: vscode.CompletionItem[] = symbols.map(s => {
         const item = itemFor(s);
-        if (['class', 'interface', 'trait', 'enum'].includes(s.kind) && s.uri.toString() !== document.uri.toString()) {
-          const ns = document.getText().match(/^\s*namespace\s+([^;{]+)/m)?.[1].trim() ?? '';
-          if (s.namespace && s.namespace !== ns && !new RegExp(`^\\s*use\\s+${escapeRegExp(s.fqName)}\\s*;`, 'm').test(document.getText())) {
-            const namespaceMatch = document.getText().match(/^\s*namespace\s+[^;{]+[;{]\s*$/m);
-            const insert = namespaceMatch ? document.positionAt(namespaceMatch.index! + namespaceMatch[0].length) : new vscode.Position(0, 0);
-            item.additionalTextEdits = [vscode.TextEdit.insert(insert, `${namespaceMatch ? '\n' : '<?php\n\n'}use ${s.fqName};\n`)];
+        if (document.languageId === 'php' && ['class', 'interface', 'trait', 'enum'].includes(s.kind) && s.uri.toString() !== document.uri.toString()) {
+          const ns = source.match(/^\s*namespace\s+([^;{]+)/m)?.[1].trim() ?? '';
+          if (s.namespace && s.namespace !== ns && !new RegExp(`^\\s*use\\s+${escapeRegExp(s.fqName)}\\s*;`, 'm').test(source)) {
+            const insert = importPosition(document);
+            const prefix = insert.line === 0 && insert.character === 0
+              ? (source.includes('<?php') ? '' : '<?php\n\n')
+              : '\n';
+            item.additionalTextEdits = [vscode.TextEdit.insert(insert, `${prefix}use ${s.fqName};\n`)];
             item.detail = `${item.detail} (auto-import)`;
           }
         }
@@ -50,8 +72,9 @@ export function registerLanguageFeatures(context: vscode.ExtensionContext, index
       for (const variable of new Set([...localText.matchAll(/\$([A-Za-z_]\w*)/g)].map(m => m[1]))) {
         const item = new vscode.CompletionItem(`$${variable}`, vscode.CompletionItemKind.Variable); item.sortText = `0_${variable}`; items.push(item);
       }
-      for (const word of keywords) items.push(new vscode.CompletionItem(word, vscode.CompletionItemKind.Keyword));
+      for (const keyword of keywords) if (!word || keyword.startsWith(word.toLowerCase())) items.push(new vscode.CompletionItem(keyword, vscode.CompletionItemKind.Keyword));
       for (const [name, info] of Object.entries(builtins)) {
+        if (word && !name.startsWith(word.toLowerCase())) continue;
         const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Function);
         item.detail = info.signature; item.documentation = new vscode.MarkdownString(`${info.description}\n\n[PHP manual](https://www.php.net/${name})`);
         items.push(item);
@@ -59,8 +82,8 @@ export function registerLanguageFeatures(context: vscode.ExtensionContext, index
       for (const tag of ['@param','@return','@throws','@var','@property','@property-read','@method','@template','@extends','@implements','@mixin','@deprecated','@see']) {
         const item = new vscode.CompletionItem(tag, vscode.CompletionItemKind.Keyword); item.sortText = `0_${tag}`; items.push(item);
       }
-      if (/\b(new|extends|implements|instanceof|use)\s+[\\\w]*$/.test(line)) return items.filter(i => [vscode.CompletionItemKind.Class, vscode.CompletionItemKind.Interface, vscode.CompletionItemKind.Enum].includes(i.kind!));
-      return items;
+      if (typeContext) return new vscode.CompletionList(items.filter(i => [vscode.CompletionItemKind.Class, vscode.CompletionItemKind.Interface, vscode.CompletionItemKind.Enum].includes(i.kind!)), symbols.length >= 300);
+      return new vscode.CompletionList(items, symbols.length >= 300);
     }
   }, '$', '>', ':', '\\', '@'));
 
@@ -139,6 +162,56 @@ export function registerLanguageFeatures(context: vscode.ExtensionContext, index
   context.subscriptions.push(vscode.languages.registerInlayHintsProvider(selector, new PhpInlayHints(index)));
   context.subscriptions.push(vscode.languages.registerTypeHierarchyProvider(selector, new PhpTypeHierarchy(index)));
   context.subscriptions.push(vscode.languages.registerCallHierarchyProvider(selector, new PhpCallHierarchy(index)));
+}
+
+function resolveTypeName(document: vscode.TextDocument, name: string): string {
+  const clean = name.replace(/^\?/, '').replace(/^\\/, '');
+  if (name.startsWith('\\')) return clean;
+  const imports = [...document.getText().matchAll(/^\s*use\s+(?!function\s|const\s)([^;]+);/gm)];
+  for (const match of imports) {
+    const imported = match[1].trim();
+    const alias = imported.match(/\s+as\s+([A-Za-z_]\w*)$/i)?.[1] ?? imported.split('\\').pop();
+    if (alias?.toLowerCase() === clean.toLowerCase()) return imported.replace(/\s+as\s+\w+$/i, '');
+  }
+  const namespace = document.getText().match(/^\s*namespace\s+([^;{]+)/m)?.[1].trim();
+  return namespace ? `${namespace}\\${clean}` : clean;
+}
+
+function inferVariableType(document: vscode.TextDocument, position: vscode.Position, variable: string): string | undefined {
+  const before = document.getText(new vscode.Range(new vscode.Position(0, 0), position));
+  if (variable === 'this') {
+    const classes = [...before.matchAll(/\b(?:class|interface|trait|enum)\s+([A-Za-z_]\w*)/g)];
+    return classes.at(-1)?.[1];
+  }
+  const escaped = escapeRegExp(variable);
+  const patterns = [
+    new RegExp(`\\$${escaped}\\s*=\\s*new\\s+([\\\\A-Za-z_]\\w*(?:\\\\[A-Za-z_]\\w*)*)`, 'g'),
+    new RegExp(`([?\\\\A-Za-z_]\\w*(?:\\\\[A-Za-z_]\\w*)*)\\s+\\$${escaped}\\b`, 'g'),
+    new RegExp(`@var\\s+([\\\\A-Za-z_]\\w*(?:\\\\[A-Za-z_]\\w*)*)\\s+\\$${escaped}\\b`, 'g'),
+    new RegExp(`@var\\s+\\$${escaped}\\s+([\\\\A-Za-z_]\\w*(?:\\\\[A-Za-z_]\\w*)*)`, 'g')
+  ];
+  for (const pattern of patterns) {
+    const matches = [...before.matchAll(pattern)];
+    const found = matches.at(-1)?.[1];
+    if (found) return found.replace(/^\?/, '');
+  }
+  return undefined;
+}
+
+function importPosition(document: vscode.TextDocument): vscode.Position {
+  const text = document.getText();
+  const patterns = [
+    /^\s*use\s+(?:function\s+|const\s+)?[^;]+;[^\S\r\n]*$/gm,
+    /^\s*namespace\s+[^;{]+;[^\S\r\n]*$/gm,
+    /^\s*declare\s*\([^;]+;[^\S\r\n]*$/gm,
+    /<\?php[^\S\r\n]*$/gm
+  ];
+  for (const pattern of patterns) {
+    const matches = [...text.matchAll(pattern)];
+    const match = matches.at(-1);
+    if (match?.index !== undefined) return document.positionAt(match.index + match[0].length);
+  }
+  return new vscode.Position(0, 0);
 }
 
 async function findReferences(name: string, includeDeclaration: boolean, token: vscode.CancellationToken): Promise<vscode.Location[]> {
