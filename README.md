@@ -8,8 +8,8 @@ PHPulse provides advanced PHP and Laravel development tools for Visual Studio Co
 - Go to definition and implementation, find references, document highlights, workspace rename, breadcrumbs, outline, workspace symbols, folding, call hierarchy, and type hierarchy.
 - PHPDoc generation, unused-import diagnostics and fixes, extract-variable and extract-constant refactoring, getter/setter generation, reference CodeLens, and parameter-name inlay hints.
 - Continuous `php -l` validation, compatibility hints, TODO highlighting, and PHPStan or Psalm integration when installed through Composer.
-- Document, selection, on-type, on-save, and batch formatting using a conservative PSR-style layout.
-- Laravel Blade highlighting, directive completion, view/component discovery, route names, configuration keys, model columns, embedded-language scopes, snippets, and formatting.
+- PHP document, selection, on-type, on-save, and batch formatting with token-preserving indentation and brace layout; optional Pint or PHP CS Fixer integration for full-file formatting.
+- Laravel Blade highlighting, directive completion, view/component discovery, route names, configuration keys, model columns, embedded-language scopes, and snippets.
 - PHPUnit and Pest discovery in VS Code's Test Explorer, individual execution, debugging, result output, and optional continuous testing.
 - PHP development-server commands, Composer installation, and an Xdebug launch configuration through the maintained `xdebug.php-debug` extension.
 
@@ -66,6 +66,18 @@ npm run package    # Produce a VSIX package
 ## Optional project tools
 
 For deeper static analysis, install either `phpstan/phpstan` or `vimeo/psalm`. Tests are detected from `tests/` and `test/`; PHPUnit or Pest should normally be available in `vendor/bin`. Xdebug 3 listens on port `9003` by default.
+
+## Safe editing and formatting
+
+The built-in PHP formatter preserves operators, strings, comments, heredocs, HTML text, and line endings. `phpulse.format.style` controls indentation and brace placement: Drupal uses two spaces, WordPress uses tabs, and the other layouts use four spaces. Allman puts block braces on their own lines; K&R keeps them on the preceding line. PSR-12, PSR-2, PER, and Laravel place declaration braces on their own lines. These are conservative layouts, not complete implementations of those standards. Selection formatting changes only fully selected lines when brace layout does not change the document's line count. Blade documents are left unchanged.
+
+Set `phpulse.format.command` to a Pint or PHP CS Fixer executable to format the entire unsaved PHP buffer through a temporary copy. The original file is not written by the formatter; VS Code receives an edit after successful execution. Paths may be absolute, workspace-relative, or executable names on `PATH`; shell arguments are not accepted. The selected style maps to a [Pint preset](https://laravel.com/framework/docs/pint) (Laravel, PSR-12, PER) or [PHP CS Fixer rule set](https://cs.symfony.com/doc/usage.html) (PSR-12, PSR-2, PER). Unsupported combinations report an error. External formatters skip selection/on-type formatting and Blade. Changed buffers and cancelled requests discard the result.
+
+Rename resolves PHP declarations and typed references, preserving unrelated symbols, strings, comments, and explicit import aliases. Inherited/implemented methods are renamed together. Unresolved local variables, import aliases, constructor-promoted properties, trait members, magic members, and ambiguous receivers are rejected instead of receiving a text replacement. Rename requires a complete index within the configured exclusions and 15,000-file limit. Dynamic string references, PHPDoc references, and Blade expressions outside PHP tags are not rewritten; review those manually when renaming public APIs.
+
+Unused-import cleanup handles grouped and comma-separated namespace imports, preserves used imports and PHPDoc references, and leaves trait uses and closure captures alone. Import statements with internal comments are retained. Constant extraction is offered for supported literal expressions inside class methods, inserts into the owning class, and chooses an unused constant name; dynamic expressions and partial expressions that could change operator precedence are not offered.
+
+`phpulse.phpVersion` controls compatibility hints for nullsafe access, attributes, match expressions, enums, readonly declarations, and the removed `each()` function. It does not emulate every PHP version: syntax validation still runs the configured PHP interpreter. Configuration changes refresh open-document diagnostics.
 
 ## Smart IntelliSense
 

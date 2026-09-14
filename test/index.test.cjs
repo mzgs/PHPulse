@@ -108,3 +108,13 @@ test('unchanged disk notifications do not invalidate symbols or fire change even
     assert.equal(changes, 0); assert.equal(index.named('Same')[0], stable);
   } finally { index.dispose(); disk.clear(); }
 });
+
+test('rename indexing refuses truncated workspaces and unreadable files', async () => {
+  const index = new PhpIndex();
+  try {
+    for (let i = 0; i < 15001; i++) disk.set(`file:///file${i}.php`, '<?php');
+    await assert.rejects(index.initialize(true), /complete index/);
+    disk.clear(); disk.set('file:///missing.php', undefined);
+    await assert.rejects(index.initialize(true), /Missing file/);
+  } finally { index.dispose(); disk.clear(); }
+});

@@ -1,6 +1,12 @@
 import * as vscode from 'vscode';
 import { PhpIndex, PhpSymbol, vscodeKind, wordRange } from './model';
 import { completePhp, resolvedSymbols, signatureHelp } from './completion';
+import { formattingEdits } from './formatting';
+import { renameEdits, renameTarget } from './rename';
+import { parseSource } from './phpSyntax';
+import { removeImports, unusedImports } from './imports';
+import { extractConstant } from './refactoring';
+export { formatPhp } from './formatting';
 
 const keywords = ['abstract','and','array','as','break','callable','case','catch','class','clone','const','continue','declare','default','do','echo','else','elseif','empty','enddeclare','endfor','endforeach','endif','endswitch','endwhile','enum','eval','exit','extends','final','finally','fn','for','foreach','function','global','goto','if','implements','include','include_once','instanceof','insteadof','interface','isset','list','match','namespace','new','or','print','private','protected','public','readonly','require','require_once','return','static','switch','throw','trait','try','unset','use','var','while','xor','yield'];
 
@@ -51,11 +57,34 @@ export function registerLanguageFeatures(context: vscode.ExtensionContext, index
     async provideReferences(document, position, options, token) { const r = wordRange(document, position); return r ? findReferences(document.getText(r), options.includeDeclaration, token) : []; }
   }));
   context.subscriptions.push(vscode.languages.registerRenameProvider(selector, {
-    prepareRename(document, position) { const r = wordRange(document, position); if (!r) throw new Error('No PHP symbol at cursor.'); return { range: r, placeholder: document.getText(r) }; },
+    prepareRename(document, position) {
+      if (document.languageId !== 'php') throw new Error('Semantic rename is available in PHP documents.');
+      const target = renameTarget(index.project, index.current(document), document.offsetAt(position));
+      const range = wordRange(document, position);
+      if (!range) throw new Error('No PHP symbol at cursor.');
+      return { range, placeholder: target.declaration.name };
+    },
     async provideRenameEdits(document, position, newName, token) {
-      const r = wordRange(document, position); if (!r || !/^[A-Za-z_]\w*$/.test(newName)) return;
+      if (token.isCancellationRequested) return;
+      const version = document.version;
+      // Refresh disk files and dirty buffers before resolving references.
+      if (document.languageId !== 'php') throw new Error('Semantic rename is available in PHP documents.');
+      await index.initialize(true);
+      if (token.isCancellationRequested) return;
+      if (document.version !== version) throw new Error('The document changed during rename. Please try again.');
+      const target = renameTarget(index.project, index.current(document), document.offsetAt(position));
+      const changes = renameEdits(index.project, target, newName);
+      const sources = new Map([...changes.keys()].map(uri => [uri, index.project.files.get(uri)!.text]));
+      const opened: { document: vscode.TextDocument; version: number }[] = [];
       const edit = new vscode.WorkspaceEdit();
-      for (const loc of await findReferences(document.getText(r), true, token)) edit.replace(loc.uri, loc.range, newName);
+      for (const [uri, edits] of changes) {
+        const doc = await vscode.workspace.openTextDocument(vscode.Uri.parse(uri));
+        if (token.isCancellationRequested) return;
+        if (doc.getText() !== sources.get(uri)) throw new Error('A document changed during rename. Please try again.');
+        opened.push({ document: doc, version: doc.version });
+        for (const e of edits) edit.replace(doc.uri, new vscode.Range(doc.positionAt(e.start), doc.positionAt(e.end)), e.text);
+      }
+      if (opened.some(d => d.document.version !== d.version)) throw new Error('A document changed during rename. Please try again.');
       return edit;
     }
   }));
@@ -83,12 +112,20 @@ export function registerLanguageFeatures(context: vscode.ExtensionContext, index
     }
   }));
 
-  const formatter = { provideDocumentFormattingEdits(document: vscode.TextDocument) { return [vscode.TextEdit.replace(new vscode.Range(0, 0, document.lineCount, 0), formatPhp(document.getText()))]; } };
-  context.subscriptions.push(vscode.languages.registerDocumentFormattingEditProvider(selector, formatter));
-  context.subscriptions.push(vscode.languages.registerDocumentRangeFormattingEditProvider(selector, { provideDocumentRangeFormattingEdits(document, range) { return [vscode.TextEdit.replace(range, formatPhp(document.getText(range)))]; } }));
-  context.subscriptions.push(vscode.languages.registerOnTypeFormattingEditProvider(selector, { provideOnTypeFormattingEdits(document, position, ch) { if (ch !== '}') return []; const line = document.lineAt(position.line); const desired = Math.max(0, indentationAt(document, position.line) - 1) * 4; return [vscode.TextEdit.replace(new vscode.Range(position.line, 0, position.line, line.firstNonWhitespaceCharacterIndex), ' '.repeat(desired))]; } }, '}'));
+  context.subscriptions.push(vscode.languages.registerDocumentFormattingEditProvider(selector, {
+    provideDocumentFormattingEdits(document, _options, token) { return formattingEdits(document, token); }
+  }));
+  context.subscriptions.push(vscode.languages.registerDocumentRangeFormattingEditProvider(selector, {
+    provideDocumentRangeFormattingEdits(document, range, _options, token) { return formattingEdits(document, token, range); }
+  }));
+  context.subscriptions.push(vscode.languages.registerOnTypeFormattingEditProvider(selector, {
+    provideOnTypeFormattingEdits(document, position, ch, _options, token) {
+      if (ch !== '}') return [];
+      return formattingEdits(document, token, document.lineAt(position.line).range);
+    }
+  }, '}'));
 
-  const codeActions = new PhpCodeActions();
+  const codeActions = new PhpCodeActions(index);
   context.subscriptions.push(vscode.languages.registerCodeActionsProvider(selector, codeActions, { providedCodeActionKinds: PhpCodeActions.kinds }));
   const lenses = new PhpCodeLens(index); context.subscriptions.push(lenses, vscode.languages.registerCodeLensProvider(selector, lenses));
   context.subscriptions.push(vscode.languages.registerInlayHintsProvider(selector, new PhpInlayHints(index)));
@@ -106,37 +143,37 @@ async function findReferences(name: string, includeDeclaration: boolean, token: 
 
 function escapeRegExp(s: string): string { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
 
-function indentationAt(doc: vscode.TextDocument, line: number): number {
-  let level = 0; for (let i = 0; i < line; i++) { const text = doc.lineAt(i).text.replace(/(['"]).*?\1/g, ''); level += (text.match(/\{/g) ?? []).length - (text.match(/\}/g) ?? []).length; } return level;
-}
-
-export function formatPhp(text: string): string {
-  let depth = 0; let inHeredoc = false;
-  return text.split(/\r?\n/).map(raw => {
-    const trimmed = raw.trim();
-    if (/<<<['"]?\w+/.test(trimmed)) inHeredoc = true;
-    if (inHeredoc) { if (/^\w+;?$/.test(trimmed) && !trimmed.includes('<<<')) inHeredoc = false; return raw; }
-    if (!trimmed) return '';
-    if (/^[}\])]/.test(trimmed) || /^@(end|else|elseif|case|default)/.test(trimmed)) depth = Math.max(0, depth - 1);
-    let line = '    '.repeat(depth) + trimmed
-      .replace(/\s*=>\s*/g, ' => ').replace(/\s*=\s*(?!=|>)/g, ' = ').replace(/,\s*/g, ', ')
-      .replace(/\b(if|for|foreach|while|switch|catch)\s*\(/g, '$1 (');
-    if (/[{[]\s*(?:\/\/.*)?$/.test(trimmed) || /^@(if|foreach|for|while|switch|section|php)\b/.test(trimmed)) depth++;
-    if (/^}\s*(else|elseif|catch|finally)\b/.test(trimmed) || /^@(else|elseif|case|default)\b/.test(trimmed)) depth++;
-    return line;
-  }).join('\n').replace(/\n{3,}/g, '\n\n') + (text.endsWith('\n') ? '\n' : '');
-}
-
 class PhpCodeActions implements vscode.CodeActionProvider {
-  static readonly kinds = [vscode.CodeActionKind.QuickFix, vscode.CodeActionKind.RefactorRewrite, vscode.CodeActionKind.SourceOrganizeImports];
+  constructor(private index: PhpIndex) {}
+  static readonly kinds = [vscode.CodeActionKind.QuickFix, vscode.CodeActionKind.RefactorRewrite, vscode.CodeActionKind.RefactorExtract, vscode.CodeActionKind.SourceOrganizeImports];
   provideCodeActions(document: vscode.TextDocument, range: vscode.Range, context: vscode.CodeActionContext): vscode.CodeAction[] {
     const actions: vscode.CodeAction[] = [];
+    const file = parseSource(document.getText());
+    const unused = unusedImports(file);
     for (const diagnostic of context.diagnostics) {
-      if (diagnostic.code === 'unused-import') { const a = new vscode.CodeAction('Remove unused import', vscode.CodeActionKind.QuickFix); a.edit = new vscode.WorkspaceEdit(); a.edit.delete(document.uri, document.lineAt(diagnostic.range.start.line).rangeIncludingLineBreak); a.diagnostics = [diagnostic]; a.isPreferred = true; actions.push(a); }
+      if (diagnostic.code !== 'unused-import') continue;
+      // Recompute against the current buffer; diagnostic positions may be stale.
+      const item = unused.find(i => i.nameStart === document.offsetAt(diagnostic.range.start));
+      if (!item) continue;
+      const changes = removeImports(file, [item]);
+      if (!changes.length) continue;
+      const action = new vscode.CodeAction('Remove unused import', vscode.CodeActionKind.QuickFix);
+      action.edit = new vscode.WorkspaceEdit();
+      for (const e of changes) action.edit.replace(document.uri, new vscode.Range(document.positionAt(e.start), document.positionAt(e.end)), e.text);
+      action.diagnostics = [diagnostic]; action.isPreferred = true; actions.push(action);
     }
     const selected = document.getText(range);
     if (selected && !range.isEmpty) { const a = new vscode.CodeAction('Extract to local variable', vscode.CodeActionKind.RefactorExtract); const edit = new vscode.WorkspaceEdit(); const indent = document.lineAt(range.start.line).text.match(/^\s*/)?.[0] ?? ''; edit.insert(document.uri, new vscode.Position(range.start.line, 0), `${indent}$extracted = ${selected};\n`); edit.replace(document.uri, range, '$extracted'); a.edit = edit; actions.push(a); }
-    if (selected && !range.isEmpty) { const a = new vscode.CodeAction('Extract to class constant', vscode.CodeActionKind.RefactorExtract); const edit = new vscode.WorkspaceEdit(); const constant = 'EXTRACTED_VALUE'; const classLine = document.getText().slice(0, document.offsetAt(range.start)).lastIndexOf('{'); if (classLine >= 0) { const insert = document.positionAt(classLine + 1); edit.insert(document.uri, insert, `\n    private const ${constant} = ${selected};`); edit.replace(document.uri, range, `self::${constant}`); a.edit = edit; actions.push(a); } }
+    if (selected && !range.isEmpty) {
+      this.index.current(document);
+      const changes = extractConstant(document.getText(), document.offsetAt(range.start), document.offsetAt(range.end), this.index.project);
+      if (changes) {
+        const action = new vscode.CodeAction('Extract to class constant', vscode.CodeActionKind.RefactorExtract);
+        action.edit = new vscode.WorkspaceEdit();
+        for (const e of changes) action.edit.replace(document.uri, new vscode.Range(document.positionAt(e.start), document.positionAt(e.end)), e.text);
+        actions.push(action);
+      }
+    }
     const property = document.lineAt(range.start.line).text.match(/(?:(\??[\\A-Za-z_]\w*(?:[|&][\\A-Za-z_]\w*)*)\s+)?\$([A-Za-z_]\w*)/);
     if (property) {
       const type = property[1] ?? 'mixed'; const name = property[2]; const pascal = name[0].toUpperCase() + name.slice(1); const lastBrace = document.getText().lastIndexOf('}');

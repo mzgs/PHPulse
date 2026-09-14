@@ -3,6 +3,9 @@ import { spawn, ChildProcessWithoutNullStreams } from 'child_process';
 import * as path from 'path';
 import * as fs from 'fs';
 import { PhpIndex } from './model';
+import { parseSource } from './phpSyntax';
+import { removeImports, unusedImports } from './imports';
+import { compatibilityIssues } from './compatibility';
 
 interface RunResult { code: number; stdout: string; stderr: string }
 
@@ -23,35 +26,47 @@ export class Diagnostics implements vscode.Disposable {
   readonly collection = vscode.languages.createDiagnosticCollection('phpulse');
   private timers = new Map<string, NodeJS.Timeout>();
   private disposables: vscode.Disposable[];
+  private disposed = false;
   constructor(private output: vscode.OutputChannel) {
     this.disposables = [
       vscode.workspace.onDidOpenTextDocument(d => this.schedule(d)),
       vscode.workspace.onDidSaveTextDocument(d => this.schedule(d)),
       vscode.workspace.onDidChangeTextDocument(e => this.schedule(e.document)),
-      vscode.workspace.onDidCloseTextDocument(d => this.collection.delete(d.uri))
+      vscode.workspace.onDidCloseTextDocument(d => {
+        const key = d.uri.toString(); clearTimeout(this.timers.get(key)); this.timers.delete(key); this.collection.delete(d.uri);
+      }),
+      vscode.workspace.onDidChangeConfiguration(e => {
+        if (e.affectsConfiguration('phpulse')) for (const doc of vscode.workspace.textDocuments) this.schedule(doc);
+      })
     ];
     vscode.workspace.textDocuments.forEach(d => this.schedule(d));
   }
   schedule(doc: vscode.TextDocument): void {
-    if (doc.languageId !== 'php' || !vscode.workspace.getConfiguration('phpulse.diagnostics').get('enable', true)) return;
+    if (this.disposed || doc.languageId !== 'php') return;
     const key = doc.uri.toString(); const prior = this.timers.get(key); if (prior) clearTimeout(prior);
-    this.timers.set(key, setTimeout(() => this.validate(doc), 450));
+    if (!vscode.workspace.getConfiguration('phpulse.diagnostics', doc.uri).get('enable', true)) { this.collection.delete(doc.uri); this.timers.delete(key); return; }
+    this.timers.set(key, setTimeout(() => { this.timers.delete(key); void this.validate(doc); }, 450));
   }
   async validate(doc: vscode.TextDocument): Promise<void> {
     const diagnostics: vscode.Diagnostic[] = [];
-    const php = vscode.workspace.getConfiguration('phpulse').get('phpExecutable', 'php');
-    const syntax = await run(php, ['-d', 'display_errors=1', '-l'], path.dirname(doc.fileName), doc.getText());
+    const text = doc.getText(), version = doc.version;
+    const php = vscode.workspace.getConfiguration('phpulse', doc.uri).get('phpExecutable', 'php');
+    const syntax = await run(php, ['-d', 'display_errors=1', '-l'], path.dirname(doc.fileName), text);
+    if (this.disposed || doc.isClosed || doc.version !== version || !vscode.workspace.getConfiguration('phpulse.diagnostics', doc.uri).get('enable', true)) return;
     const syntaxText = `${syntax.stdout}\n${syntax.stderr}`;
     const error = syntaxText.match(/(?:Parse error|Fatal error):\s*(.+?)\s+in (?:Standard input code|.+?) on line (\d+)/s);
     if (error) diagnostics.push(new vscode.Diagnostic(new vscode.Range(Math.max(0, +error[2] - 1), 0, Math.max(0, +error[2] - 1), Number.MAX_SAFE_INTEGER), error[1].replace(/\s+/g, ' ').trim(), vscode.DiagnosticSeverity.Error));
 
-    const text = doc.getText();
-    for (const m of text.matchAll(/^\s*use\s+(?:function\s+|const\s+)?([^;]+);/gm)) {
-      const imported = m[1].split(',');
-      for (const part of imported) { const name = (part.match(/\bas\s+(\w+)/i)?.[1] ?? part.trim().split('\\').pop() ?? '').trim(); const rest = text.slice(0, m.index) + text.slice(m.index! + m[0].length); if (name && !new RegExp(`\\b${escapeRegExp(name)}\\b`).test(rest)) { const start = doc.positionAt(m.index!); const d = new vscode.Diagnostic(new vscode.Range(start.line, 0, start.line, doc.lineAt(start.line).text.length), `Unused import '${name}'.`, vscode.DiagnosticSeverity.Hint); d.tags = [vscode.DiagnosticTag.Unnecessary]; d.code = 'unused-import'; diagnostics.push(d); } }
+    for (const item of unusedImports(parseSource(text))) {
+      const d = new vscode.Diagnostic(new vscode.Range(doc.positionAt(item.nameStart), doc.positionAt(item.nameEnd)), `Unused import '${item.imported.alias}'.`, vscode.DiagnosticSeverity.Hint);
+      d.tags = [vscode.DiagnosticTag.Unnecessary]; d.code = 'unused-import'; diagnostics.push(d);
     }
     for (const m of text.matchAll(/\b(TODO|FIXME|HACK|XXX)\b:?\s*([^\r\n]*)/g)) { const start = doc.positionAt(m.index!); const d = new vscode.Diagnostic(new vscode.Range(start, start.translate(0, m[1].length)), `${m[1]}: ${m[2].trim() || 'task marker'}`, vscode.DiagnosticSeverity.Information); d.code = 'todo'; diagnostics.push(d); }
-    if (/\beach\s*\(/.test(text)) { const i = text.search(/\beach\s*\(/); diagnostics.push(new vscode.Diagnostic(new vscode.Range(doc.positionAt(i), doc.positionAt(i + 4)), 'each() was removed in PHP 8.0.', vscode.DiagnosticSeverity.Warning)); }
+    const target = vscode.workspace.getConfiguration('phpulse', doc.uri).get('phpVersion', '8.4');
+    for (const issue of compatibilityIssues(text, target)) {
+      const d = new vscode.Diagnostic(new vscode.Range(doc.positionAt(issue.start), doc.positionAt(issue.end)), issue.message, vscode.DiagnosticSeverity.Warning);
+      d.code = 'php-version'; diagnostics.push(d);
+    }
     this.collection.set(doc.uri, diagnostics); this.output.appendLine(`Validated ${doc.uri.fsPath}: ${diagnostics.length} issue(s)`);
   }
   async analyzeWorkspace(): Promise<void> {
@@ -62,7 +77,7 @@ export class Diagnostics implements vscode.Disposable {
     if (!tool) { await Promise.all(vscode.workspace.textDocuments.filter(d => d.languageId === 'php').map(d => this.validate(d))); void vscode.window.showInformationMessage('PHP lint analysis completed. Install PHPStan or Psalm for deeper workspace analysis.'); return; }
     this.output.show(true); const args = tool.endsWith('phpstan') ? ['analyse', '--error-format=raw', '--no-progress'] : ['--output-format=console']; const result = await run(tool, args, root); this.output.append(`${result.stdout}${result.stderr}`); void vscode.window.showInformationMessage(result.code === 0 ? 'PHP static analysis passed.' : 'PHP analysis found issues; see PHPulse output.');
   }
-  dispose(): void { this.timers.forEach(clearTimeout); this.disposables.forEach(d => d.dispose()); this.collection.dispose(); }
+  dispose(): void { this.disposed = true; this.timers.forEach(clearTimeout); this.disposables.forEach(d => d.dispose()); this.collection.dispose(); }
 }
 
 export class PhpTests implements vscode.Disposable {
@@ -148,7 +163,13 @@ export function registerCommands(context: vscode.ExtensionContext, index: PhpInd
     vscode.commands.registerCommand('phpulse.stopServer', () => { server?.dispose(); server = undefined; }),
     vscode.commands.registerCommand('phpulse.openManual', async () => { const editor = vscode.window.activeTextEditor; if (!editor) return; const range = editor.document.getWordRangeAtPosition(editor.selection.active); const name = range ? editor.document.getText(range) : ''; if (name) await vscode.env.openExternal(vscode.Uri.parse(`https://www.php.net/${encodeURIComponent(name)}`)); }),
     vscode.commands.registerCommand('phpulse.formatWorkspace', async () => { const files = await vscode.workspace.findFiles('**/*.{php,phtml,inc,blade.php}', '**/{vendor,node_modules}/**'); await vscode.window.withProgress({ location: vscode.ProgressLocation.Notification, title: 'PHPulse: formatting PHP files', cancellable: true }, async (progress, token) => { let done = 0; for (const uri of files) { if (token.isCancellationRequested) break; const edits = await vscode.commands.executeCommand<vscode.TextEdit[]>('vscode.executeFormatDocumentProvider', uri); if (edits?.length) { const edit = new vscode.WorkspaceEdit(); edit.set(uri, edits); await vscode.workspace.applyEdit(edit); const doc = await vscode.workspace.openTextDocument(uri); await doc.save(); } progress.report({ increment: 100 / files.length, message: `${++done}/${files.length}` }); } }); }),
-    vscode.commands.registerCommand('phpulse.removeUnusedImports', async () => { const editor = vscode.window.activeTextEditor; if (!editor) return; const edits = diagnostics.collection.get(editor.document.uri)?.filter(d => d.code === 'unused-import').map(d => vscode.TextEdit.delete(editor.document.lineAt(d.range.start.line).rangeIncludingLineBreak)) ?? []; const ws = new vscode.WorkspaceEdit(); ws.set(editor.document.uri, edits); await vscode.workspace.applyEdit(ws); }),
+    vscode.commands.registerCommand('phpulse.removeUnusedImports', async () => {
+      const editor = vscode.window.activeTextEditor; if (!editor || editor.document.languageId !== 'php') return;
+      const doc = editor.document, file = parseSource(doc.getText());
+      const ws = new vscode.WorkspaceEdit();
+      for (const e of removeImports(file, unusedImports(file))) ws.replace(doc.uri, new vscode.Range(doc.positionAt(e.start), doc.positionAt(e.end)), e.text);
+      await vscode.workspace.applyEdit(ws);
+    }),
     vscode.commands.registerCommand('phpulse.generateDocblock', async () => generateDocblock()),
     vscode.commands.registerCommand('phpulse.createLaunchConfig', async () => createLaunchConfig()),
     vscode.window.onDidCloseTerminal(t => { if (t === server) server = undefined; })

@@ -177,7 +177,7 @@ export class PhpProject {
       if (t.kind !== 'variable') continue;
       names.add(t.value.slice(1));
     }
-    if (scope?.arrow) for (const name of this.variables(file, scope.start)) names.add(name);
+    if (scope?.arrow) for (const name of this.variables(file, scope.start - 1)) names.add(name);
     return [...names];
   }
 

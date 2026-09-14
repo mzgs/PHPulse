@@ -144,3 +144,12 @@ test('global completion and import collision checks avoid scanning all workspace
   assert.ok(items.some(i => label(i) === '\\Domain\\User'));
   assert.ok(items.some(i => label(i) === 'UserRepository'));
 });
+
+test('arrow function completion includes captures without recursing into its own scope', () => {
+  const x = complete('<?php $outer = 1; $f = fn($value) => $ou|;');
+  assert.ok(x.items.some(i => label(i) === '$outer'));
+  const y = complete('<?php $outer = 1; $f = fn($first) => fn($second) => $fi|;');
+  assert.ok(y.items.some(i => label(i) === '$first'));
+  const z = complete('<?php $outer = 1; $f = fn($first) => fn($second) => $ou|;');
+  assert.ok(z.items.some(i => label(i) === '$outer'));
+});

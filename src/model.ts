@@ -73,9 +73,10 @@ export class PhpIndex implements vscode.Disposable {
       vscode.workspace.onDidCloseTextDocument(d => { const timer = this.refreshTimers.get(d.uri.toString()); if (timer) clearTimeout(timer); this.refreshTimers.delete(d.uri.toString()); void refresh(d.uri); })
     );
   }
-  async initialize(): Promise<void> {
+  async initialize(requireComplete = false): Promise<void> {
     const exclude = vscode.workspace.getConfiguration('phpulse.index').get<string[]>('exclude', []);
-    const files = await vscode.workspace.findFiles('**/*.{php,phtml,inc}', exclude.length ? `{${exclude.join(',')}}` : undefined, 15000);
+    const files = await vscode.workspace.findFiles('**/*.{php,phtml,inc}', exclude.length ? `{${exclude.join(',')}}` : undefined, requireComplete ? 15001 : 15000);
+    if (requireComplete && files.length > 15000) throw new Error('Workspace rename requires a complete index. Narrow phpulse.index.exclude or use a smaller workspace (limit: 15,000 PHP files).');
     const retained = new Set([...files.map(u => u.toString()), ...vscode.workspace.textDocuments.map(d => d.uri.toString())]);
     for (const uri of this.project.files.keys()) if (!retained.has(uri)) this.project.remove(uri);
     for (let i = 0; i < files.length && !this.disposed; i += 100) {
@@ -84,7 +85,7 @@ export class PhpIndex implements vscode.Disposable {
           const text = Buffer.from(await vscode.workspace.fs.readFile(uri)).toString('utf8');
           const open = vscode.workspace.textDocuments.find(d => d.uri.toString() === uri.toString());
           if (!this.disposed) this.project.update(uri.toString(), open?.getText() ?? text);
-        } catch { /* Unreadable file. */ }
+        } catch (error) { if (requireComplete) throw error; /* Unreadable file. */ }
       }));
     }
     for (const d of vscode.workspace.textDocuments) if (this.accepts(d)) this.project.update(d.uri.toString(), d.getText());
