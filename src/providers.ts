@@ -18,12 +18,31 @@ const builtins: Record<string, { signature: string; description: string }> = {
   var_dump: { signature: 'var_dump(mixed $value, mixed ...$values): void', description: 'Dumps information about a variable.' }
 };
 
+const completionRank = {
+  variable: '0',
+  userFunction: '1',
+  userType: '2',
+  otherUserSymbol: '3',
+  builtinFunction: '4',
+  keyword: '5',
+  phpDocTag: '6'
+} as const;
+
+function rankedSortText(rank: string, label: string): string {
+  return `${rank}_${label.toLowerCase()}`;
+}
+
 function itemFor(s: PhpSymbol): vscode.CompletionItem {
   const kinds: Record<string, vscode.CompletionItemKind> = { class: vscode.CompletionItemKind.Class, interface: vscode.CompletionItemKind.Interface, trait: vscode.CompletionItemKind.Class, enum: vscode.CompletionItemKind.Enum, function: vscode.CompletionItemKind.Function, method: vscode.CompletionItemKind.Method, property: vscode.CompletionItemKind.Property, constant: vscode.CompletionItemKind.Constant };
   const item = new vscode.CompletionItem(s.name, kinds[s.kind]);
   item.detail = `${s.kind} ${s.fqName}${s.signature ? ` — ${s.signature}` : ''}`;
   item.documentation = s.doc ? new vscode.MarkdownString(`\`\`\`php\n${s.doc}\n\`\`\``) : undefined;
-  item.sortText = s.uri.scheme === 'file' ? `1_${s.name}` : `2_${s.name}`;
+  const rank = s.kind === 'function'
+    ? completionRank.userFunction
+    : ['class', 'interface', 'trait', 'enum'].includes(s.kind)
+      ? completionRank.userType
+      : completionRank.otherUserSymbol;
+  item.sortText = rankedSortText(rank, s.name);
   if (s.kind === 'function' || s.kind === 'method') item.insertText = new vscode.SnippetString(`${s.name}($0)`);
   return item;
 }
@@ -40,9 +59,9 @@ export function registerLanguageFeatures(context: vscode.ExtensionContext, index
         const staticAccess = member[3] === '::';
         const memberKinds = new Set<PhpSymbol['kind']>(staticAccess ? ['method', 'constant'] : ['method', 'property']);
         const candidates = (typeName
-          ? index.membersOf(resolveTypeName(document, typeName), member[4] ?? '')
+          ? index.membersOf(resolveTypeName(document, typeName, position), member[4] ?? '')
           : index.completionCandidates(member[4] ?? '', memberKinds))
-          .filter(s => staticAccess ? s.kind !== 'property' : s.kind !== 'constant');
+          .filter(s => staticAccess ? s.kind === 'constant' || s.isStatic : s.kind !== 'constant');
         return new vscode.CompletionList(candidates.map(itemFor), candidates.length >= 300);
       }
 
@@ -68,19 +87,45 @@ export function registerLanguageFeatures(context: vscode.ExtensionContext, index
         }
         return item;
       });
+      const enclosingType = !typeContext ? enclosingTypeName(document, position) : undefined;
+      if (enclosingType) {
+        const typeName = resolveTypeName(document, enclosingType, position);
+        for (const method of index.membersOf(typeName, word).filter(s => s.kind === 'method' && s.isStatic)) {
+          const owner = method.container ?? enclosingType;
+          const item = itemFor(method);
+          item.label = `${owner}::${method.name}()`;
+          item.filterText = word || method.name;
+          item.insertText = new vscode.SnippetString(`${owner}::${method.name}($0)`);
+          item.sortText = rankedSortText(completionRank.userFunction, method.name);
+          items.push(item);
+        }
+      }
       const localText = document.getText(new vscode.Range(new vscode.Position(0, 0), position));
       for (const variable of new Set([...localText.matchAll(/\$([A-Za-z_]\w*)/g)].map(m => m[1]))) {
-        const item = new vscode.CompletionItem(`$${variable}`, vscode.CompletionItemKind.Variable); item.sortText = `0_${variable}`; items.push(item);
+        const item = new vscode.CompletionItem(`$${variable}`, vscode.CompletionItemKind.Variable);
+        // Match against the identifier itself so typing "fil" gives "$filters"
+        // the same prefix-match score as functions and keywords without a "$".
+        item.filterText = variable;
+        item.sortText = rankedSortText(completionRank.variable, variable);
+        items.push(item);
       }
-      for (const keyword of keywords) if (!word || keyword.startsWith(word.toLowerCase())) items.push(new vscode.CompletionItem(keyword, vscode.CompletionItemKind.Keyword));
+      for (const keyword of keywords) {
+        if (word && !keyword.startsWith(word.toLowerCase())) continue;
+        const item = new vscode.CompletionItem(keyword, vscode.CompletionItemKind.Keyword);
+        item.sortText = rankedSortText(completionRank.keyword, keyword);
+        items.push(item);
+      }
       for (const [name, info] of Object.entries(builtins)) {
         if (word && !name.startsWith(word.toLowerCase())) continue;
         const item = new vscode.CompletionItem(name, vscode.CompletionItemKind.Function);
         item.detail = info.signature; item.documentation = new vscode.MarkdownString(`${info.description}\n\n[PHP manual](https://www.php.net/${name})`);
+        item.sortText = rankedSortText(completionRank.builtinFunction, name);
         items.push(item);
       }
       for (const tag of ['@param','@return','@throws','@var','@property','@property-read','@method','@template','@extends','@implements','@mixin','@deprecated','@see']) {
-        const item = new vscode.CompletionItem(tag, vscode.CompletionItemKind.Keyword); item.sortText = `0_${tag}`; items.push(item);
+        const item = new vscode.CompletionItem(tag, vscode.CompletionItemKind.Keyword);
+        item.sortText = rankedSortText(completionRank.phpDocTag, tag);
+        items.push(item);
       }
       if (typeContext) return new vscode.CompletionList(items.filter(i => [vscode.CompletionItemKind.Class, vscode.CompletionItemKind.Interface, vscode.CompletionItemKind.Enum].includes(i.kind!)), symbols.length >= 300);
       return new vscode.CompletionList(items, symbols.length >= 300);
@@ -164,9 +209,13 @@ export function registerLanguageFeatures(context: vscode.ExtensionContext, index
   context.subscriptions.push(vscode.languages.registerCallHierarchyProvider(selector, new PhpCallHierarchy(index)));
 }
 
-function resolveTypeName(document: vscode.TextDocument, name: string): string {
+function resolveTypeName(document: vscode.TextDocument, name: string, position?: vscode.Position): string {
   const clean = name.replace(/^\?/, '').replace(/^\\/, '');
   if (name.startsWith('\\')) return clean;
+  if (/^(?:self|static)$/i.test(clean) && position) {
+    const enclosing = enclosingTypeName(document, position);
+    if (enclosing) return resolveTypeName(document, enclosing);
+  }
   const imports = [...document.getText().matchAll(/^\s*use\s+(?!function\s|const\s)([^;]+);/gm)];
   for (const match of imports) {
     const imported = match[1].trim();
@@ -175,6 +224,20 @@ function resolveTypeName(document: vscode.TextDocument, name: string): string {
   }
   const namespace = document.getText().match(/^\s*namespace\s+([^;{]+)/m)?.[1].trim();
   return namespace ? `${namespace}\\${clean}` : clean;
+}
+
+function enclosingTypeName(document: vscode.TextDocument, position: vscode.Position): string | undefined {
+  const before = document.getText(new vscode.Range(new vscode.Position(0, 0), position));
+  const declarations = [...before.matchAll(/\b(?:class|interface|trait|enum)\s+([A-Za-z_]\w*)[^\{]*/g)];
+  for (let i = declarations.length - 1; i >= 0; i--) {
+    const declaration = declarations[i];
+    const openBrace = before.indexOf('{', declaration.index! + declaration[0].length);
+    if (openBrace < 0) continue;
+    const body = before.slice(openBrace);
+    const depth = (body.match(/\{/g) ?? []).length - (body.match(/\}/g) ?? []).length;
+    if (depth > 0) return declaration[1];
+  }
+  return undefined;
 }
 
 function inferVariableType(document: vscode.TextDocument, position: vscode.Position, variable: string): string | undefined {

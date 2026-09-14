@@ -14,6 +14,7 @@ export interface PhpSymbol {
   signature?: string;
   doc?: string;
   extends?: string[];
+  isStatic?: boolean;
 }
 
 const kindMap: Record<PhpSymbolKind, vscode.SymbolKind> = {
@@ -130,13 +131,13 @@ export function parsePhp(uri: vscode.Uri, text: string): PhpSymbol[] {
   let pendingDoc = '';
   let inDoc = false;
 
-  const add = (name: string, kind: PhpSymbolKind, line: number, start: number, signature?: string, ext?: string[]) => {
+  const add = (name: string, kind: PhpSymbolKind, line: number, start: number, signature?: string, ext?: string[], isStatic?: boolean) => {
     const container = currentType?.name;
     const fqName = kind === 'method' || kind === 'property' || kind === 'constant'
       ? `${namespace ? namespace + '\\' : ''}${container ?? ''}::${name}`
       : `${namespace ? namespace + '\\' : ''}${name}`;
     const selectionRange = new vscode.Range(line, start, line, start + name.length);
-    symbols.push({ name, fqName, kind, uri, range: new vscode.Range(line, 0, line, lines[line].length), selectionRange, namespace, container, signature, doc: pendingDoc, extends: ext });
+    symbols.push({ name, fqName, kind, uri, range: new vscode.Range(line, 0, line, lines[line].length), selectionRange, namespace, container, signature, doc: pendingDoc, extends: ext, isStatic });
     pendingDoc = '';
   };
 
@@ -158,7 +159,10 @@ export function parsePhp(uri: vscode.Uri, text: string): PhpSymbol[] {
     }
 
     const fn = line.match(/\bfunction\s+&?\s*([A-Za-z_]\w*)\s*(\([^)]*\)(?:\s*:\s*[^\s{;]+)?)/);
-    if (fn) add(fn[1], currentType ? 'method' : 'function', lineNo, line.indexOf(fn[1]), `${fn[1]}${fn[2]}`);
+    if (fn) {
+      const declarationPrefix = line.slice(0, fn.index);
+      add(fn[1], currentType ? 'method' : 'function', lineNo, line.indexOf(fn[1]), `${fn[1]}${fn[2]}`, undefined, /\bstatic\b/.test(declarationPrefix));
+    }
 
     if (currentType) {
       for (const m of line.matchAll(/(?:public|protected|private|static|readonly|var|\s)+\s*(?:[?\\A-Za-z_|&][\\A-Za-z0-9_|&?]*\s+)?\$([A-Za-z_]\w*)/g)) {
