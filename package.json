@@ -83,8 +83,20 @@
       }
     },
     "configurationDefaults": {
-      "[php]": { "editor.defaultFormatter": "local.phpulse-vscode", "editor.formatOnType": true, "editor.suggest.insertMode": "replace" },
-      "[blade]": { "editor.defaultFormatter": "local.phpulse-vscode" }
+      "[php]": {
+        "editor.defaultFormatter": "local.phpulse-vscode",
+        "editor.formatOnType": true,
+        "editor.suggest.insertMode": "replace",
+        "editor.quickSuggestions": { "other": "on", "comments": "off", "strings": "on" },
+        "editor.suggestOnTriggerCharacters": true,
+        "editor.inlineSuggest.suppressSuggestions": false
+      },
+      "[blade]": {
+        "editor.defaultFormatter": "local.phpulse-vscode",
+        "editor.quickSuggestions": { "other": "on", "comments": "off", "strings": "on" },
+        "editor.suggestOnTriggerCharacters": true,
+        "editor.inlineSuggest.suppressSuggestions": false
+      }
     }
   }
 }
